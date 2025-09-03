@@ -1,0 +1,329 @@
+1 — Project Summary (one-liner)
+
+Build a retrieval + recommendation + grounded Q&A system over the McAuley-Lab Amazon reviews dataset from hugging face that (a) answers product questions with citations from reviews/descriptions, (b) returns personalized / similarity-based product recommendations, and (c) supports side-by-side product comparisons — delivered as a demo web app (FastAPI + Streamlit/Gradio).
+
+2 — High-level Architecture
+
+Components:
+
+Data Layer: Parquet/SQLite for structured product & review store; 
+
+Indexing & Vector DB: FAISS (local) for MVP; optional Milvus/Weaviate for scale.
+
+Embedding Models: SBERT family for bi-encoder (recall), higher-capacity cross-encoder (BERT/MS-MARCO) for rerank.
+
+Retrieval Pipeline: Query → Bi-encoder recall (top-50) → Reranker (cross-encoder or LightGBM) → Top results.
+
+RAG Q&A: Retrieve top-k chunks → LLM prompt with citations → formatted answer.
+
+CTR/Conversion Module: Synthetic logs → LightGBM/DeepFM for prediction and ranking weights.
+
+API & UI: FastAPI backend, Streamlit/Gradio front end for demo.
+
+Monitoring & Testing: Metrics collection, unit + integration tests, human eval process.
+
+3 — Data & Schema (MVP slice)
+
+Start with one category (e.g., Electronics).
+
+Product table (Parquet / SQLite):
+
+products(
+  asin TEXT PRIMARY KEY,
+  title TEXT,
+  brand TEXT,
+  category TEXT,
+  price REAL,
+  description TEXT,
+  image_url TEXT,
+  avg_rating REAL,
+  num_reviews INT,
+  created_at DATE
+)
+
+
+Review table:
+
+reviews(
+  review_id TEXT PRIMARY KEY,
+  asin TEXT,
+  review_text TEXT,
+  rating INT,
+  helpful_votes INT,
+  review_date DATE,
+  reviewer_id TEXT
+)
+
+
+Vector store metadata for each chunk:
+
+{
+  "chunk_id": "...",
+  "asin": "...",
+  "type": "review|description",
+  "text": "...",
+  "start_char": 0,
+  "end_char": 512,
+  "helpful_votes": 12,
+  "rating": 4
+}
+
+4 — Data Pipeline & Preprocessing Tasks (Phase 1)
+
+Objectives: ingest, normalize, chunk, store.
+
+Tasks:
+
+Ingest HF dataset (streaming) and sample category slice (50k–100k reviews, 10k–20k products).
+
+Normalize fields (price parsing, category canonicalization, drop duplicates).
+
+Clean review text: remove HTML, non-UTF8, normalize whitespace, lowercase (keep original saved).
+
+Extract top-2 helpful reviews per product (by helpful_votes).
+
+Chunk descriptions & reviews to ≈500 tokens with ~20% overlap (store chunk metadata).
+
+Persist products & chunks as Parquet + metadata table in SQLite.
+
+Acceptance criteria:
+
+Parquet files exist and contain schema above.
+
+20–100 chunks per product (depending on text length) with chunk metadata.
+
+Helpful snippet (Python pseudocode):
+
+def chunk_text(text, tokenizer, max_tokens=500, overlap_tokens=100):
+    tokens = tokenizer.encode(text)
+    chunks = []
+    for i in range(0, len(tokens), max_tokens - overlap_tokens):
+        chunk = tokenizer.decode(tokens[i:i+max_tokens])
+        chunks.append(chunk)
+    return chunks
+
+5 — Embeddings & Indexing (Phase 2)
+
+Objectives: build bi-encoder embeddings, index with FAISS, enable top-50 retrieval.
+
+Configuration recommendations (MVP):
+
+Bi-encoder: sentence-transformers/all-MiniLM-L6-v2 or all-mpnet-base-v2 (tradeoff speed/quality).
+
+Embedding dim: model specific (e.g., 384 / 768).
+
+FAISS index: HNSW for low-latency approximate search; IVF+PQ when dataset grows.
+
+Store mapping: faiss_id -> chunk_id in SQLite.
+
+Indexing tasks:
+
+Encode all chunks in batches 
+
+Build / train FAISS index (HNSW params: M=32, efConstruction=200) — these are tunable.
+
+Persist FAISS index and chunk metadata.
+
+Retrieval flow:
+
+Query → bi-encoder embedding.
+
+FAISS search → top-50 chunk ids.
+
+Load chunk metadata + dedupe by asin, aggregate by product if needed.
+
+Acceptance criteria:
+
+Query retrieval returns relevant chunks (manual spot checks + precision@k automated test).
+
+6 — Candidate Generation → Reranking (Phase 3)
+
+Two reranking options (both supported):
+
+Option A — Cross-encoder reranker
+
+Model: cross-encoder/ms-marco-MiniLM-L-6-v2 or bert-base-uncased fine-tuned on pairwise relevance.
+
+Input: [query, chunk_text] → score. Rerank top-50 to top-10/20.
+
+Training data: synth pairs from reviews labeled by helpful_votes or create synthetic queries from review sentences.
+
+Option B — LightGBM (Learning to Rank)
+
+Features:
+
+Query–chunk semantic similarity (bi-encoder cosine).
+
+Cross-encoder score (if available).
+
+Review sentiment score (VADER / transformer sentiment).
+
+Price proximity (if user specified price intent).
+
+Popularity: avg_rating, helpful_votes, recency.
+
+CTR proxy features (clicks in synthetic logs).
+
+Label: relevance (derived from user actions or heuristics).
+
+Train with LightGBM ranker.
+
+Acceptance criteria:
+
+Reranker improves NDCG@10 over bi-encoder baseline on synthetic test queries.
+
+7 — CTR / Conversion Modeling
+
+Goal: produce ranking weight adjustments tuned to predicted clicks/purchases.
+
+Pipeline:
+
+Generate synthetic interaction logs (simulate exposures, CTR by product popularity + relevance).
+
+Train LightGBM or DeepFM for CTR prediction with features (query features, product popularity, price distance).
+
+Use CTR predictions to rescore final ranking list.
+
+Acceptance criteria:
+
+Model produces sensible probability distributions and improves simulated CTR in offline A/B test.
+
+8 — RAG Q&A Module (Phase 4)
+
+Flow:
+
+User query → retrieve top-k chunks (k=5–10) via retrieval + rerank.
+
+Construct LLM prompt: include instruction, retrieved chunks (short), provenance metadata (asin, review_id, rating), and the user question.
+
+Call LLM (e.g., gemini api ) to produce a grounded answer with inline citations (e.g., [asin:XXXX, review_id:YYYY]).
+
+Postprocess: extract highlights, confidence score, and include product suggestions (3–5).
+
+Prompt template (example):
+
+You are an assistant that answers product questions using only the provided source chunks. ...
+SOURCES:
+[1] asin: B000..., rating: 5: "Battery lasts 8 hours..."
+[2] asin: B000..., rating: 2: "Overheats under heavy load..."
+QUESTION: Is this laptop good for gaming?
+ANSWER FORMAT:
+- Short answer (1-2 sentences).
+- Evidence bullets with citations referencing source numbers.
+- Caveats.
+
+
+Grounding & hallucination handling:
+
+If the LLM adds facts not in sources, append "[UNVERIFIED]" or return "I don't have supporting evidence for that".
+
+Always include the top-3 supporting chunks as citations.
+
+Acceptance criteria:
+
+≥ X% of answers have direct supporting citations (measured by automated check).
+
+9 — Product Comparison
+
+UI behavior:
+
+User selects two products or asks “Compare A vs B”.
+
+Retrieve product metadata (specs), top reviews for each, and generate a summary of differences (strengths/weaknesses).
+
+Present side-by-side specs + a short natural language summary.
+
+Implementation notes:
+
+Build a product spec normalizer (map spec names to canonical keys).
+
+For free-text specs, extract entities (regexes for RAM, CPU, GPU, screen size).
+
+Acceptance criteria:
+
+Comparison modal shows canonical keys for core specs (CPU, GPU, RAM, display, battery, price) and a short paragraph summarizing tradeoffs with citations.
+
+10 — Demo App (Phase 5)
+
+Stack:
+
+Backend: FastAPI (search endpoints, RAG endpoint, recommendation endpoint).
+
+Frontend: Streamlit or Gradio for quick prototyping.
+
+Authentication not required for MVP: add later.
+
+Dockerize backend + frontend.
+
+UI elements:
+
+Search bar + question type toggle (Q&A vs. Recommendation vs. Compare).
+
+Answer card with citations.
+
+Recommendation grid (3–6 items) with relevance + popularity badges.
+
+Compare modal with specs + bullet summary.
+
+Option to view supporting review snippets.
+
+Acceptance criteria:
+
+User can type a question and see an answer + 3 recommendations + ability to compare any two products.
+
+11 — Evaluation Plan (detailed)
+
+Metrics to compute offline:
+
+Retrieval: Precision@k, Recall@k, MRR over synthetic queries.
+
+Ranking: NDCG@10, MAP.
+
+CTR/Conversion model: AUC, Logloss.
+
+Q&A: groundedness (% of claims supported by retrieved chunks), BLEU/ROUGE to reference answers (if available), and human eval scores (helpfulness/accuracy).
+
+Human eval protocol: label 200 answers (correct/incorrect/partially correct) and rate helpfulness 1–5.
+
+Test cases:
+
+Create a suite of 100 real user-style queries (e.g., “Is this laptop good for gaming?”, “Battery life for phone X?”, “Compare X vs Y for video editing”).
+
+For each: store expected products or answer tags to compute precision.
+
+Deliverables (exact)
+
+Code repo with:
+
+data/ ETL notebooks and Parquet exports.
+
+indexing/ FAISS index builder scripts.
+
+models/ reranker + CTR model training notebooks.
+
+api/ FastAPI app.
+
+ui/ Streamlit/Gradio app.
+
+tests/ unit + integration tests.
+
+Artifacts: FAISS index files, embedding model config, trained reranker, CTR model.
+
+Demo: docker-compose to run API + UI locally.
+
+README: end-to-end run instructions and evaluation notes.
+
+
+repo/
+├─ data/
+│  ├─ raw/
+│  └─ parquet/
+├─ src/
+│  ├─ etl/
+│  ├─ indexing/
+│  ├─ models/
+│  ├─ api/
+│  └─ ui/
+├─ tests/
+├─ docker/
+└─ README.md
